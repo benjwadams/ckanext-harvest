@@ -3,6 +3,7 @@ import re
 import uuid
 
 from sqlalchemy.sql import update, bindparam
+from sqlalchemy.exc import IntegrityError
 from pylons import config
 
 from ckan import plugins as p
@@ -109,12 +110,18 @@ class HarvesterBase(SingletonPlugin):
         :type append_type: string
         '''
         ideal_name = ideal_name[:PACKAGE_NAME_MAX_LENGTH]
+        # possibly dead code here, existing name does not seem to be
+        # passed in by the previous methods, but it really should not be
+        # returning if the name already exists
         if existing_name == ideal_name:
             return ideal_name
         if append_type == 'number-sequence':
             MAX_NUMBER_APPENDED = 999
             APPEND_MAX_CHARS = len(str(MAX_NUMBER_APPENDED))
         elif append_type == 'random-hex':
+            # max retries for UUID collisions before giving up.  In practice
+            # this should not occur very often
+            MAX_RETRIES = 10
             APPEND_MAX_CHARS = 5  # 16^5 = 1 million combinations
         else:
             raise NotImplementedError('append_type cannot be %s' % append_type)
@@ -146,10 +153,20 @@ class HarvesterBase(SingletonPlugin):
                 if candidate_name not in taken:
                     return candidate_name
                 counter = counter + 1
+                log.warn("Dataset starting with title '{}' exhausted all possible unique name permutations".format(ideal_name))
             return None
         elif append_type == 'random-hex':
-            return ideal_name[:PACKAGE_NAME_MAX_LENGTH-APPEND_MAX_CHARS] + \
-                str(uuid.uuid4())[:APPEND_MAX_CHARS]
+            counter = 0
+            while counter < MAX_RETRIES:
+                candidate_name = ideal_name[:PACKAGE_NAME_MAX_LENGTH-APPEND_MAX_CHARS] + \
+                    str(uuid.uuid4())[:APPEND_MAX_CHARS]
+                if candidate_name not in taken:
+                    return candidate_name
+                else:
+                    counter += 1
+            # if counter exhausts itself, return None
+            log.warn("Dataset starting with title '{}' exhausted all UUID combinations tried.".format(ideal_name))
+            return None
 
     _save_gather_error = HarvestGatherError.create
     _save_object_error = HarvestObjectError.create
@@ -339,11 +356,17 @@ class HarvesterBase(SingletonPlugin):
                 # exception
                 context.pop('__auth_audit', None)
 
-                # Set name for new package to prevent name conflict, see issue #117
+                #
+                # Set name for new package to prevent name conflict, see
+                # issue #117
+                append_meth = config.get('ckan.harvest.dup_append_type',
+                                         'number-sequence')
                 if package_dict.get('name', None):
-                    package_dict['name'] = self._gen_new_name(package_dict['name'])
+                    package_dict['name'] = self._gen_new_name(package_dict['name'],
+                                                              append_type)
                 else:
-                    package_dict['name'] = self._gen_new_name(package_dict['title'])
+                    package_dict['name'] = self._gen_new_name(package_dict['title'],
+                                                              append_type)
 
                 log.info('Package with GUID %s does not exist, let\'s create it' % harvest_object.guid)
                 harvest_object.current = True
@@ -356,9 +379,15 @@ class HarvesterBase(SingletonPlugin):
                 model.Session.execute('SET CONSTRAINTS harvest_object_package_id_fkey DEFERRED')
                 model.Session.flush()
 
-                new_package = p.toolkit.get_action(
-                    'package_create' if package_dict_form == 'package_show'
-                    else 'package_create_rest')(context, package_dict)
+                try:
+                    new_package = p.toolkit.get_action(
+                        'package_create' if package_dict_form == 'package_show'
+                        else 'package_create_rest')(context, package_dict)
+                # if there was a unique name key collision, or id collision,
+                # handle the exception by logging it for now.
+                except IntegrityError as e:
+                    log.error("A referential integrity error occurred while attempting to save package {}: {}"\
+                              .format(package_dict['name'], e))
 
             Session.commit()
 
